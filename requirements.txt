@@ -1,0 +1,19 @@
+# Verified against the existing Conda environment: env11
+# Python 3.11.13 / PyTorch 2.8.0+cu128 / CUDA runtime 12.8
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+accelerate==1.12.0
+gymnasium==1.1.1
+matplotlib==3.7.2
+numpy==1.26.0
+pandas==2.0.3
+peft==0.18.1
+pygame==2.6.1
+safetensors==0.6.2
+scikit-learn==1.7.0
+scipy==1.16.1
+stable-baselines3==2.6.0
+swanlab==0.7.5
+tensorboard==2.19.0
+torch==2.8.0+cu128
+transformers==4.57.6
