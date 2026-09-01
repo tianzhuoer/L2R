@@ -50,20 +50,6 @@ During offline learning, the frozen forecaster periodically predicts five future
 
 A **vertical leg** is the interval between two successive direction reversals. Leg-level rewards are evaluated only at a turning point and after a minimum leg length, limiting reward exploitation through rapid switching.
 
-## Reported results
-
-In the accompanying manuscript, F2R and the attention-based reference policy were evaluated in 100 matched CTD scenarios using identical initial depths, episode durations, and random seeds.
-
-| Metric | Reference policy | F2R |
-|---|---:|---:|
-| Mean first-acquisition step | 27.5 | **12.9** |
-| Scenarios acquired within 20 steps | 62% | **97%** |
-| Episode-averaged distance to thermocline center | 35.6 m | 35.2 m |
-| Samples within the +/-20 m thermocline band | 35.8% | 27.7% |
-| Reversals within the +/-20 m thermocline band | 38.3% | 27.8% |
-
-F2R acquired the thermocline earlier in 71% of paired scenarios. The principal observed benefit was faster thermocline discovery while maintaining an episode-averaged distance comparable to the reference policy. Lower band occupancy and reversal fractions indicate that F2R remained more exploratory after acquisition rather than concentrating exclusively near the thermocline center.
-
 ## Repository structure
 
 ```text
@@ -176,4 +162,4 @@ The pipeline loads the CTD environments, initializes the fixed reference branch,
 
 ## Citation
 
-This repository accompanies the manuscript **“LLM-informed forecast-to-reward learning for lightweight ocean thermocline sampling on autonomous underwater vehicles.”** Citation metadata will be added after publication.
+To be updated.
