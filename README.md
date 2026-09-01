@@ -1,218 +1,179 @@
-# L2R: Language-to-Reinforcement Learning for Thermocline Tracking
+# Forecast-to-Reward (F2R) Policy Learning
 
-L2R 使用语言模型驱动的温跃层深度预测，为 Attention DQN 提供奖励塑形信号，使 AUV
-能够在动态 CTD 温盐剖面中搜索、接近并持续采样温跃层。
+This repository contains the reinforcement-learning component of **Forecast-to-Reward (F2R)**, an offline forecast-guided framework for lightweight adaptive thermocline sampling with autonomous underwater vehicles (AUVs).
 
-## 方法
+F2R uses an LLM-based thermocline forecaster only during offline policy training. Forecast thermocline-center depths are converted into shaped rewards for learning a residual adaptation head on top of a pretrained attention-based reference policy. After training, the forecaster is removed. The deployed policy maps onboard conductivity-temperature-depth (CTD) observation histories directly to vertical actions and therefore does not require an LLM, an explicit environmental model, or online planning aboard the vehicle.
+
+The companion forecasting implementation, **ThermoTSF-Reprogram**, is available in [ThermoCast](https://github.com/tianzhuoer/ThermoCast).
+
+## Method overview
+
+F2R treats adaptive thermocline sampling as a partially observable sequential decision-making problem. At each step, the AUV has access only to local CTD measurements collected along its trajectory. Its actions determine both where it moves and which part of the water column it observes next.
+
+The framework contains three coordinated components:
+
+1. **Attention-based reference policy.** A pretrained policy, denoted by `Q_ref`, provides basic thermocline-observation behavior, including vertical exploration, repeated observation of high-gradient regions, and compliance with motion boundaries.
+2. **ThermoTSF-Reprogram forecaster.** A separately trained and frozen LLM-based forecaster predicts the next five thermocline-center depths from trajectory-dependent depth, temperature, and salinity observations.
+3. **Forecast-to-reward adaptation.** Forecasts are converted into dense and vertical-leg-level rewards. Only a residual Q-adapter is optimized; the inherited reference-policy branch remains fixed.
 
 ```text
-CTD 温盐深数据
-      │
-      ▼
-温跃层跟踪环境 ── 最近 20 步局部 T/S 观测 ──► Attention DQN ──► AUV 动作
-      │                                              │
-      └──► Reprogram-TSF + LLM ─► 温跃层深度预测 ──► 奖励塑形
-                                                     │
-预训练 Attention DQN ───────────────────────────────► KL 稳定项
+Q_F2R(s, a) = Q_ref(s, a) + DeltaQ_phi(s, a)
 ```
 
-训练目标由两部分组成：
+`DeltaQ_phi` is a two-layer residual Q-adapter whose final layer is initialized to zero. Training combines a temporal-difference objective with an annealed KL regularizer that anchors the adapted policy to the fixed reference policy during early learning.
 
-1. Double-DQN 的 TD 损失，用于学习任务策略。
-2. 当前策略与预训练参考策略之间的退火 KL 正则，用于降低微调初期的策略漂移。
+```text
+Partial CTD histories
+        |
+        +-----------------------> fixed reference branch Q_ref ---+
+        |                                                         |
+        +-----------------------> residual Q-adapter DeltaQ_phi --+--> vertical action
+        |
+        +--> frozen ThermoTSF-Reprogram --> forecast depths
+                                              |
+                                              +--> shaped reward (offline only)
 
-LLM/TSF 预测不直接替代 RL 策略，而是在 AUV 完成一个升沉 leg 时，根据轨迹是否穿越
-预测温跃层区间、leg 中心与预测深度的距离及覆盖跨度生成奖励。
+Deployment: CTD histories --> Q_ref + DeltaQ_phi --> vertical action
+            (ThermoTSF-Reprogram is removed)
+```
 
-## 目录结构
+## Forecast-informed reward
+
+During offline learning, the frozen forecaster periodically predicts five future thermocline-center depths. Their screened, smoothed mean defines the forecast depth used by the reward. The implementation combines:
+
+- a **dense attraction reward** based on distance to the forecast depth;
+- an **exploration reward** for newly visited depth intervals;
+- a **leg-span reward** that discourages short-cycle reversals;
+- a **crossing reward** for overlap between a completed vertical leg and the forecast thermocline band;
+- a **leg-midpoint reward** that encourages sampling on both sides of the forecast depth; and
+- a **boundary penalty** for invalid or incomplete vertical steps.
+
+A **vertical leg** is the interval between two successive direction reversals. Leg-level rewards are evaluated only at a turning point and after a minimum leg length, limiting reward exploitation through rapid switching.
+
+## Reported results
+
+In the accompanying manuscript, F2R and the attention-based reference policy were evaluated in 100 matched CTD scenarios using identical initial depths, episode durations, and random seeds.
+
+| Metric | Reference policy | F2R |
+|---|---:|---:|
+| Mean first-acquisition step | 27.5 | **12.9** |
+| Scenarios acquired within 20 steps | 62% | **97%** |
+| Episode-averaged distance to thermocline center | 35.6 m | 35.2 m |
+| Samples within the +/-20 m thermocline band | 35.8% | 27.7% |
+| Reversals within the +/-20 m thermocline band | 38.3% | 27.8% |
+
+F2R acquired the thermocline earlier in 71% of paired scenarios. The principal observed benefit was faster thermocline discovery while maintaining an episode-averaged distance comparable to the reference policy. Lower band occupancy and reversal fractions indicate that F2R remained more exploratory after acquisition rather than concentrating exclusively near the thermocline center.
+
+## Repository structure
 
 ```text
 .
-├── train.py                    # L2R 主训练入口
-├── config.py                   # RL、环境、路径和日志配置
-├── thermocline_env.py          # 温跃层跟踪 Gymnasium 环境
-├── generate_split_manifest.py  # CTD 文件级数据划分
-├── requirements.txt
-├── .env.example
-│
-├── models/
-│   └── attention_dqn.py        # Attention DQN
-├── utils/
-│   ├── ctd_data.py             # CTD 数据读取和采样
-│   └── replay_memory.py        # 序列经验回放
-├── llm_tsf/
-│   ├── configs/
-│   │   ├── shared.py
-│   │   └── reprogram.py
-│   └── models/
-│       └── reprogram_backbone.py
-│
-├── data/                       # 本地 CTD 数据，不提交
-├── checkpoints/                # 预训练 DQN、LoRA 和回归头，不提交
-└── modelsave/                  # 新训练权重，不提交
+|-- train.py                    # F2R policy-training entry point
+|-- config.py                   # environment, RL, paths, and logging settings
+|-- thermocline_env.py          # Gymnasium thermocline-sampling environment
+|-- generate_split_manifest.py  # season-balanced, file-level partitioning
+|-- models/
+|   `-- attention_dqn.py        # attention-based DQN components
+|-- utils/
+|   |-- ctd_data.py             # CTD loading and sampling
+|   `-- replay_memory.py        # sequential experience replay
+|-- llm_tsf/
+|   |-- configs/                # frozen forecaster configuration
+|   `-- models/reprogram_backbone.py
+|-- data/                       # local data; not versioned
+|-- checkpoints/                # reference-policy and forecaster weights
+`-- modelsave/                  # trained F2R policies
 ```
 
-## Conda 环境
+## Installation
 
-本项目已使用现有 Conda 环境 `env11` 验证，实际版本基线为：
-
-```text
-Python 3.11.13
-PyTorch 2.8.0+cu128
-CUDA runtime 12.8
-```
-
-在当前开发机器上直接使用：
-
-```powershell
-conda activate env11
-python -c "import torch; print(torch.__version__, torch.version.cuda)"
-python train.py
-```
-
-如果需要在另一台机器创建独立环境，使用从 `env11` 提炼出的最小配置：
+The code was developed with Python 3.11.13, PyTorch 2.8.0+cu128, and CUDA 12.8.
 
 ```bash
 conda env create -f environment.yml
 conda activate l2r
 ```
 
-`environment.yml` 和 `requirements.txt` 中的核心包版本均来自当前可正常导入 L2R 的
-`env11`，没有导出该环境内与本项目无关的数百个工具包。
-
-若目标机器不支持 CUDA 12.8，请先根据该机器的 CUDA/驱动安装匹配的 PyTorch，再安装
-其余依赖；此时不要强行安装 `torch==2.8.0+cu128`。
-
-仅在已有兼容 Python 环境中使用 pip 时：
+Alternatively:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 数据
+If CUDA 12.8 is unavailable, install the PyTorch build appropriate for the target driver and runtime before installing the remaining dependencies.
 
-训练环境读取包含以下字段的 CTD MATLAB 文件：
+## Data preparation
 
-- 深度网格
-- 温度剖面
-- 盐度剖面
-- MATLAB datenum 时间网格
+The environment expects CTD MATLAB files containing a depth grid, temperature profiles, salinity profiles, and a MATLAB `datenum` time grid. The default location is `data/ctd`.
 
-默认数据目录是 `data/ctd`。也可以设置：
+```bash
+export L2R_CTD_DIR=/path/to/CTD
+export L2R_SPLIT_MANIFEST=/path/to/CTD/split_manifest.json
+python generate_split_manifest.py
+```
+
+PowerShell:
 
 ```powershell
 $env:L2R_CTD_DIR = "D:\datasets\CTD"
 $env:L2R_SPLIT_MANIFEST = "D:\datasets\CTD\split_manifest.json"
-```
-
-Linux：
-
-```bash
-export L2R_CTD_DIR=/data/CTD
-export L2R_SPLIT_MANIFEST=/data/CTD/split_manifest.json
-```
-
-生成文件级数据划分：
-
-```bash
 python generate_split_manifest.py
 ```
 
-manifest 会将文件分到 `rl_train`、`llm_train`、`llm_val`、`llm_test`、
-`validation` 和 `test`，用于隔离 RL 与 LLM 训练数据。
+The manifest assigns complete files to `rl_train`, `llm_train`, `llm_val`, `llm_test`, `validation`, or `test`. This prevents CTD files used to fine-tune ThermoTSF-Reprogram from being reused to construct F2R policy-training environments.
 
-## 检查点
-
-需要准备三类权重：
+## Required checkpoints
 
 ```text
 checkpoints/
-├── pretrained_attention_dqn.pth
-├── llm/
-│   └── base_model/             # Hugging Face 基座模型完整目录
-└── reprogram/
-    ├── lora_best/
-    │   ├── adapter_config.json
-    │   └── model.safetensors
-    └── head_best.pt
+|-- pretrained_attention_dqn.pth
+|-- llm/
+|   `-- base_model/             # complete local Qwen3.5-2B directory
+`-- reprogram/
+    |-- lora_best/              # LoRA adapter
+    `-- head_best.pt            # reprogramming modules and regression head
 ```
 
-路径可以通过环境变量覆盖：
+| Variable | Purpose | Default |
+|---|---|---|
+| `L2R_CTD_DIR` | CTD data directory | `data/ctd` |
+| `L2R_SPLIT_MANIFEST` | file-level split manifest | `<CTD_DIR>/split_manifest.json` |
+| `L2R_TSF_DATA` | optional prepared forecasting dataset | `data/thermo_tsf` |
+| `L2R_PRETRAIN_MODEL` | pretrained reference policy | `checkpoints/pretrained_attention_dqn.pth` |
+| `L2R_LORA_DIR` | ThermoTSF-Reprogram LoRA adapter | `checkpoints/reprogram/lora_best` |
+| `L2R_HEAD_PATH` | reprogramming modules and regression head | `checkpoints/reprogram/head_best.pt` |
+| `L2R_BASE_MODEL` | local Qwen3.5-2B directory | `checkpoints/llm/base_model` |
 
-```powershell
-$env:L2R_PRETRAIN_MODEL = "D:\models\attention_dqn.pth"
-$env:L2R_LORA_DIR = "D:\models\reprogram\lora_best"
-$env:L2R_HEAD_PATH = "D:\models\reprogram\head_best.pt"
-$env:L2R_BASE_MODEL = "checkpoints\llm\base_model"
-```
+The repository does not automatically load `.env`; set variables in the shell, scheduler, or container environment.
 
-将 Hugging Face 模型仓库的完整内容放入 `checkpoints/llm/base_model/`。目录中应包含
-模型配置、tokenizer 配置及分片权重。也可以通过 `L2R_BASE_MODEL` 指向其他本地目录。
-
-## 训练
-
-在项目根目录运行：
+## Training
 
 ```bash
 python train.py
 ```
 
-训练会：
+The pipeline loads the CTD environments, initializes the fixed reference branch, loads the frozen forecaster, constructs forecast-informed rewards, and updates only the residual Q-adapter using sequential experience replay, temporal-difference learning, and annealed KL regularization. Logs are written to TensorBoard and SwanLab, and trained policies are saved under `modelsave/`.
 
-1. 加载 CTD 数据并创建温跃层跟踪环境。
-2. 加载预训练 Attention DQN 作为初始化和 KL 参考策略。
-3. 加载冻结的 LLM LoRA 与 Reprogram-TSF 回归模块。
-4. 检查 RL 与 LLM 数据使用范围。
-5. 执行序列经验回放和 Double-DQN 更新。
-6. 写入 TensorBoard 与 SwanLab 日志。
-7. 将最终策略保存到 `modelsave/`。
-
-默认训练参数：
-
-| 参数 | 默认值 |
+| Setting | Default |
 |---|---:|
-| 深度范围 | `[-200, 0] m` |
-| belief 窗口 | 20 步 |
-| 每步温度/盐度采样点 | 各 15 |
-| 最大 episode 长度 | 300 |
-| 总回合数 | 5000 |
-| replay 预热回合 | 100 |
-| DQN hidden size | 64 |
-| Attention heads / layers | 4 / 2 |
+| Policy depth range | `[-200, 0] m` |
+| CTD belief window | 20 steps |
+| Partial temperature/salinity profile | 15 bins per modality |
+| Vertical action increment | 5 m |
+| Maximum episode length | 300 steps |
+| Attention hidden size | 64 |
+| Attention heads / decoder layers | 4 / 2 |
+| Initial / final KL coefficient | 5.0 / 0.3 |
+| KL annealing duration | 1,000 episodes |
 
-超参数集中在 `config.py` 和 `train.py` 顶部。没有可用 GPU 时，训练入口自动缩短为
-50 回合，用于基本调试。
+## Scope and reproducibility
 
-## 配置方式
+- The forecaster supplies information only through offline reward shaping and is not part of onboard inference.
+- The policy controls vertical motion only and represents the thermocline by a single maximum-gradient center depth.
+- The manuscript experiments use South China Sea CTD records; the results should not be interpreted as global validation.
+- Data, pretrained models, checkpoints, and experiment logs are not distributed here.
+- This repository currently has no explicit software license. Obtain permission before reuse and verify the licenses of all datasets and pretrained weights.
 
-支持的环境变量：
+## Citation
 
-| 变量 | 用途 | 默认值 |
-|---|---|---|
-| `L2R_CTD_DIR` | CTD 数据目录 | `data/ctd` |
-| `L2R_SPLIT_MANIFEST` | 数据划分清单 | `<CTD_DIR>/split_manifest.json` |
-| `L2R_TSF_DATA` | 可选的 TSF 数据集目录 | `data/thermo_tsf` |
-| `L2R_PRETRAIN_MODEL` | 预训练 Attention DQN | `checkpoints/pretrained_attention_dqn.pth` |
-| `L2R_LORA_DIR` | LLM LoRA adapter | `checkpoints/reprogram/lora_best` |
-| `L2R_HEAD_PATH` | Reprogram-TSF 回归模块 | `checkpoints/reprogram/head_best.pt` |
-| `L2R_BASE_MODEL` | Hugging Face 基座模型本地目录 | `checkpoints/llm/base_model` |
-
-`.env.example` 仅作为配置模板；项目不会自动读取 `.env`。请在 shell、任务调度器或
-容器环境中设置这些变量。
-
-## 版本控制
-
-`.gitignore` 已排除：
-
-- CTD 数据与缓存
-- DQN、LoRA、回归头和 ONNX 权重
-- TensorBoard、SwanLab 和运行日志
-- 图片、输出、虚拟环境及 IDE 配置
-
-首次发布前，请确认所使用的 CTD 数据、Qwen 基座模型和训练权重具有允许公开或再分发
-的许可证。项目代码许可证尚未指定，公开前需要由项目所有者选择。
-
-## 当前状态
-
-完整训练需要用户提供 CTD 数据、预训练 Attention DQN、LLM LoRA 和 Reprogram-TSF
-回归头。
+This repository accompanies the manuscript **“LLM-informed forecast-to-reward learning for lightweight ocean thermocline sampling on autonomous underwater vehicles.”** Citation metadata will be added after publication.
